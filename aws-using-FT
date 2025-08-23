@@ -1,0 +1,227 @@
+import serial, time, sys
+
+# ==== USER CONFIG ====
+COM_PORT = "COM5"      
+BAUD_RATE = 115200
+APN = "airtelgprs.com"
+HOST = "e8l1s9g0bk.execute-api.us-east-2.amazonaws.com"
+PATH = "/test/DynamoDBManager"
+PORT = 443
+SEND_INTERVAL_MS = 30000
+
+ROOT_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+"""
+MODEM_CA_NAME = "aws_root_ca.pem"
+
+ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1)
+
+def sendAT(cmd, delay_ms=500):
+    print(f">> {cmd}")
+    ser.write((cmd + "\r\n").encode())
+    time.sleep(delay_ms/1000.0)
+    
+
+def getResponse(timeout_ms=2000):
+    end_t = time.time() + (timeout_ms/1000.0)
+    buf = ""
+    while time.time() < end_t:
+        if ser.in_waiting:
+            buf += ser.read(ser.in_waiting).decode(errors="ignore")
+    return buf.strip()
+
+def waitFor(expected, timeout_ms=5000):
+    end_t = time.time() + (timeout_ms/1000.0)
+    data = ""
+    while time.time() < end_t:
+        if ser.in_waiting:
+            chunk = ser.read(ser.in_waiting).decode(errors="ignore")
+            data += chunk
+            if expected in data:
+                return True
+    return False
+
+def flushSerial():
+    while ser.in_waiting:
+        ser.read(ser.in_waiting)
+
+def initializeModem():
+    flushSerial()
+    sendAT("AT")
+    if not waitFor("OK", 3000): return False
+    sendAT("ATE0"); waitFor("OK", 2000)
+    sendAT("AT+CMEE=2"); waitFor("OK", 2000)
+    sendAT("AT+CPIN?"); 
+    if not waitFor("+CPIN: READY", 3000): return False
+    sendAT("AT+CSQ"); waitFor("OK", 2000)
+    sendAT("AT+CEREG?"); 
+    if not waitFor(",1", 3000):
+        sendAT("AT+CREG?")
+        if not waitFor("0,1", 3000) and not waitFor("0,5", 3000):
+            return False
+    sendAT(f'AT+CGDCONT=1,"IP","{APN}"'); waitFor("OK", 3000)
+    sendAT("AT+NETCLOSE"); waitForEither("+NETCLOSE:", "OK", 5000)
+    sendAT("AT+NETOPEN"); waitForEither("+NETOPEN: 0", "ALREADY CONNECT", 30000)
+    sendAT("AT+IPADDR"); waitFor("+IPADDR", 5000)
+    return True
+
+def waitForEither(a, b, timeout_ms=10000):
+    """
+    Wait for either substring 'a' or 'b' to appear in serial response.
+    Returns True if either is found within timeout, else False.
+    """
+    end_time = time.time() + (timeout_ms / 1000.0)
+    response = ""
+    while time.time() < end_time:
+        if ser.in_waiting:
+            chunk = ser.read(ser.in_waiting).decode(errors="ignore")
+            response += chunk
+            if (a and a in response) or (b and b in response):
+                print(f"<< {response}")
+                return True
+        time.sleep(0.01)
+    print(f"<< {response}")
+    print(f"ERROR: neither '{a}' nor '{b}' found")
+    return False
+
+
+def cert_present(filename):
+    sendAT("AT+CCERTLIST", 300)
+    resp = getResponse(3000)
+    return filename in resp
+
+def upload_ca_if_needed(pem_data, modem_name):
+    if cert_present(modem_name):
+        print(f"Root CA already present as '{modem_name}'.")
+        return True
+    blob = pem_data.encode()
+    print(f"Uploading Root CA to module as '{modem_name}' ({len(blob)} bytes)...")
+    sendAT(f'AT+CCERTDOWN="{modem_name}",{len(blob)}', 300)
+    if not waitFor(">", 3000):
+        print("Modem did not accept CCERTDOWN.")
+        return False
+    ser.write(blob)
+    ser.write(b"\x1A")  
+    ok = waitFor("OK", 15000)
+    print("Upload OK" if ok else "Upload failed")
+    return ok
+
+def configure_ssl_context_for_api_gw(ctx=0):
+    sendAT(f'AT+CSSLCFG="sslversion",{ctx},3', 300)
+    waitFor("OK", 3000)
+    sendAT(f'AT+CSSLCFG="authmode",{ctx},1', 300)
+    waitFor("OK", 3000)
+    sendAT(f'AT+CSSLCFG="ignorelocaltime",{ctx},1', 300)
+    waitFor("OK", 3000)
+    sendAT(f'AT+CSSLCFG="negotiatetime",{ctx},120', 300)
+    waitFor("OK", 3000)
+    sendAT(f'AT+CSSLCFG="cacert",{ctx},"{MODEM_CA_NAME}"', 300)
+    return waitFor("OK", 3000)
+
+def setupLTE():
+    """
+    Attach to LTE network, open PDP context, and ensure IP is assigned.
+    Returns True if successful, False otherwise.
+    """
+    sendAT(f'AT+CGDCONT=1,"IP","{APN}"')
+    if not waitFor("OK", 3000):
+        print("Failed to set PDP context")
+        return False
+
+    sendAT("AT+NETCLOSE")
+    waitForEither("+NETCLOSE:", "OK", 5000)
+    
+    sendAT("AT+NETOPEN")
+    if not waitForEither("+NETOPEN: 0", "ALREADY CONNECT", 30000):
+        print("Failed to open LTE network session")
+        return False
+
+    sendAT("AT+IPADDR")
+    if not waitFor("+IPADDR", 5000):
+        print("Warning: IP address not obtained")
+
+    print("LTE network ready with PDP context")
+    return True
+
+
+def httpPostAWS(json_data, ctx=0):
+    sendAT(f'AT+CHTTPSOPSE="{HOST}",{PORT},{ctx}', 1000)
+    if not waitFor("OK", 5000):
+        print("Failed to open SSL session")
+        return False
+    sendAT(f'AT+CHTTPSHEAD=1,"{PATH}","Content-Type: application/json"', 500)
+    if not waitFor("OK", 3000):
+        print("Failed to set headers")
+        return False
+    sendAT(f'AT+CHTTPSSEND={len(json_data)}', 500)
+    if not waitFor(">", 3000):
+        print("Modem did not accept data")
+        return False
+    ser.write(json_data.encode())
+    ser.write(b"\x1A")
+    if not waitFor("OK", 10000):
+        print("HTTPS POST failed")
+        return False
+    sendAT('AT+CHTTPSCLSE', 500)
+    waitFor("OK", 3000)
+    return True
+
+def checkTLSCapability():
+    print("Checking TLS capability...")
+    sendAT("AT+CSSLCFG=?")
+    resp = getResponse(3000)
+    print("CSSLCFG response:", resp)
+    if "ERROR" in resp:
+        print("Modem does not support CSSLCFG (TLS config).")
+        return False
+    return True
+
+
+print("=== A7672S 4G LTE AWS HTTPS POST (Python) ===")
+time.sleep(5)
+
+if not initializeModem():
+    sys.exit("Modem initialization failed!")
+if not checkTLSCapability():
+    sys.exit("TLS not supported by firmware.")
+if not upload_ca_if_needed(ROOT_CA_PEM, MODEM_CA_NAME):
+    sys.exit("Failed to load Root CA to modem.")
+if not configure_ssl_context_for_api_gw(0):
+    sys.exit("Failed to configure SSL context.")
+
+print("Modem ready!")
+
+counter = 0
+lastSend = time.time()
+
+while True:
+    if (time.time() - lastSend) * 1000 > SEND_INTERVAL_MS:
+        counter += 1
+        json_data = (
+        '{"operation":"create","payload":'
+        f'{{"id":"{counter}","temperature":25.5,"timestamp":"2025-08-14T16:33:21Z"}}}'
+        )
+        print(f"\n=== Sending JSON: {json_data} ===")
+        if setupLTE() and httpPostAWS(json_data, ctx=0):
+            print("✓ HTTPS POST to AWS successful!")
+        else:
+            print("✗ HTTPS POST to AWS failed!")
+        lastSend = time.time()
